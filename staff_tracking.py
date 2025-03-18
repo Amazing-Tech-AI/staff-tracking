@@ -1,16 +1,15 @@
 import sys
 import cv2
+import csv
 import torch
+import datetime
 import numpy as np
+import matplotlib.pyplot as plt
 from PyQt6.QtWidgets import QApplication, QMainWindow, QLabel, QPushButton, QVBoxLayout, QWidget, QLineEdit, QSlider
 from PyQt6.QtGui import QImage, QPixmap
 from PyQt6.QtCore import QTimer, Qt
 from deep_sort_realtime.deepsort_tracker import DeepSort
 from ultralytics import YOLOv10
-
-import csv
-import datetime  # Thêm thư viện datetime
-import matplotlib.pyplot as plt
 
 # Min/Max số người trong camera
 max_people_count = 0
@@ -19,7 +18,6 @@ min_people_count = float('inf')  # Để tìm giá trị nhỏ nhất ban đầu
 # Min/Max số người trong từng zone
 zone_min_people = {}
 zone_max_people = {}
-
 # Thời gian xuất hiện lâu nhất/ngắn nhất trong camera
 person_appearance_times = {}  # {track_id: {'first_seen': timestamp, 'last_seen': timestamp, 'total_time': seconds}}
 longest_appearance = {'track_id': None, 'time': 0}
@@ -30,13 +28,14 @@ min_shortest_time_30s = float('inf')
 
 people_count_log = []  # Lưu số lượng người vào/ra theo thời gian
 
-
 # Biến toàn cục để vẽ và quản lý zone
 drawing = False
 start_point = (0, 0)
 end_point = (0, 0)
 fixed_zones = []
 zone_ids = []
+temp_zones = []  # Lưu các zone tạm thời khi vẽ ở trạng thái Pause
+next_zone_id = 1
 track_to_fixed_id = {}
 track_start_time = {}
 
@@ -103,7 +102,6 @@ class VideoApp(QMainWindow):
         self.setCentralWidget(container)
 
         # Khởi tạo video và YOLO
-        # self.cap = cv2.VideoCapture("./data/coffeshop.mp4")
         self.model = YOLOv10("./weights/yolov10x.pt").to("cuda" if torch.cuda.is_available() else "cpu")
         self.tracker = DeepSort(max_age=20, n_init=3)
 
@@ -125,7 +123,6 @@ class VideoApp(QMainWindow):
         self.stats_timer = QTimer()
         self.stats_timer.timeout.connect(self.export_statistics)
         self.stats_timer.start(30000)  # 30 giây
-
 
     def connect_to_stream(self):
         """Connect to RTMP stream."""
@@ -155,22 +152,54 @@ class VideoApp(QMainWindow):
         
     def toggle_video(self):
         """Chuyển đổi giữa Start và Pause."""
+        global fixed_zones, temp_zones, zone_ids, person_appearance_times, track_start_time, next_zone_id
+        current_time = cv2.getTickCount() / cv2.getTickFrequency()
         if self.is_running:
             # Đang chạy → Tạm dừng
             self.is_running = False
             self.timer.stop()
             self.toggle_button.setText("Start")  # Đổi tên nút
+
+            # **Lưu thời gian dừng lại cho từng người**
+            for track_id in person_appearance_times:
+                person_appearance_times[track_id]['paused_time'] = current_time
+
+            # **Lưu thời gian trong từng zone**
+            for track_id in track_start_time:
+                track_start_time[track_id]['paused_time'] = current_time
+
         else:
             # Đang dừng → Chạy tiếp
             self.is_running = True
+            # Khi bấm Start, chuyển các zone tạm thời thành zone chính thức với ID
+            for zone in temp_zones:
+                fixed_zones.append(zone)  # Chuyển zone tạm thành zone chính thức
+                zone_ids.append(next_zone_id)  # Gán ID mới cho zone
+                next_zone_id += 1  # Tăng ID
+
             self.timer.start(30)
             self.toggle_button.setText("Pause")  # Đổi tên nút
+            temp_zones.clear()  # Xóa danh sách zone tạm
 
             # Khi chạy tiếp, giữ lại những zone đã vẽ trước đó
             if self.last_frame is not None:
                 updated_frame = self.last_frame.copy()
                 updated_frame = self.draw_fixed_zones(updated_frame)  # Hiển thị zone đã vẽ
                 self.display_frame(updated_frame)  # Cập nhật giao diện
+
+            for track_id in person_appearance_times:
+                if 'paused_time' in person_appearance_times[track_id]:
+                    paused_duration = current_time - person_appearance_times[track_id]['paused_time']
+                    person_appearance_times[track_id]['first_seen'] += paused_duration
+                    person_appearance_times[track_id]['last_seen'] += paused_duration
+                    del person_appearance_times[track_id]['paused_time']  # Xóa để tránh cập nhật lại
+
+            # **Cập nhật lại thời gian trong từng zone**
+            for track_id in track_start_time:
+                if 'paused_time' in track_start_time[track_id]:
+                    paused_duration = current_time - track_start_time[track_id]['paused_time']
+                    track_start_time[track_id]['start_time'] += paused_duration
+                    del track_start_time[track_id]['paused_time']  # Xóa để tránh cập nhật lại
 
     def stop_video(self):
         """Dừng video và đặt về đầu."""
@@ -192,22 +221,32 @@ class VideoApp(QMainWindow):
     
     def reset_tracking_data(self):
         """Reset tất cả dữ liệu tracking nhưng giữ vùng zone và dữ liệu CSV."""
-        global person_appearance_times, longest_appearance, shortest_appearance, track_to_fixed_id, track_start_time
+        global person_appearance_times, longest_appearance, shortest_appearance
+        global track_to_fixed_id, track_start_time, max_people_count, min_people_count
+        global max_longest_time_30s, min_shortest_time_30s, people_count_log, zone_min_people, zone_max_people
 
-        # Xóa tất cả dữ liệu tracking
-        # time_camera.clear()  # Xóa danh sách theo dõi thời gian của từng người
-        track_to_fixed_id.clear()  # Xóa ID của tracking
-        track_start_time.clear()  # Xóa thời gian bắt đầu của tracking
+        # Xóa tất cả dữ liệu tracking nhưng giữ lại vùng zone
+        track_to_fixed_id.clear()
+        track_start_time.clear()
+        person_appearance_times.clear()
+        people_count_log.clear()
+        zone_min_people.clear()
+        zone_max_people.clear()
 
-        self.total_people_count = 0  # Reset tổng số người vào
-        self.previous_people_count = 0  # Reset số người trong camera
-        self.person_out_last_30s = 0  # Reset số người rời đi
+        # Reset các biến thống kê
+        self.total_people_count = 0  
+        self.previous_people_count = 0  
+        self.person_out_last_30s = 0  
+
+        max_people_count = 0
+        min_people_count = float('inf')
+        max_longest_time_30s = 0
+        min_shortest_time_30s = float('inf')
 
         longest_appearance = {'track_id': None, 'time': 0}
         shortest_appearance = {'track_id': None, 'time': float('inf')}
 
-
-        # Reset bộ đếm ID của tracker (bắt đầu lại từ 0)
+        # Reset tracker để đảm bảo ID không tiếp tục tăng
         self.tracker = DeepSort(max_age=20, n_init=3)
 
     def update_frame(self):
@@ -219,9 +258,6 @@ class VideoApp(QMainWindow):
             self.timer.stop()
             self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
             ret, frame = self.cap.read()
-            # if ret:
-            #     self.last_frame = frame.copy()
-            #     self.display_frame(frame)
             self.is_running = False
             self.toggle_button.setText("Start")  # Đổi lại nút "Start"
             self.slider.setValue(0)  # Reset thanh trượt về đầu
@@ -238,8 +274,6 @@ class VideoApp(QMainWindow):
             return  # Không xử lý tiếp khi video đã kết thúc
         
         zone_counts = {zone_id: 0 for zone_id in zone_ids}  # Tạo dictionary đếm số lượng người trong từng zone
-
-        global longest_time_camera, longest_time_zone
 
         # Chỉ chạy YOLO khi video đang chạy (không chạy khi tua)
         if self.is_running:
@@ -269,8 +303,6 @@ class VideoApp(QMainWindow):
 
             self.previous_people_count = person_count  # Cập nhật số người trong camera hiện tại
 
-            # Theo dõi thời gian của từng người trong camera
-            # Thời gian hiện tại
             current_timestamp = cv2.getTickCount() / cv2.getTickFrequency()
 
             for track in tracks:
@@ -344,6 +376,8 @@ class VideoApp(QMainWindow):
         self.slider.setValue(current_frame)
         self.slider.blockSignals(False)
 
+        # Sửa lỗi hiển thị zone không có trên màn hình
+        valid_zone_ids = [zone_ids[i] for i in range(len(fixed_zones))]  # Lấy đúng ID còn trên màn hình
         # Tạo overlay nền để hiển thị thông tin
         overlay = frame.copy()
         stats_x = frame.shape[1] - 250  # Góc trên bên phải
@@ -351,7 +385,7 @@ class VideoApp(QMainWindow):
 
         # Tính toán chiều cao của overlay dựa trên số lượng zone
         base_height = 180  # Chiều cao tối thiểu chứa các thông tin chung
-        zone_height = len(zone_counts) * 40  # Mỗi zone chiếm khoảng 40 pixels
+        zone_height = len(valid_zone_ids) * 40  # Mỗi zone chiếm khoảng 40 pixels
         overlay_height = base_height + zone_height  # Tổng chiều cao
 
         cv2.rectangle(overlay, (stats_x, 10), (frame.shape[1] - 10, overlay_height), (0, 0, 0), -1)
@@ -379,7 +413,7 @@ class VideoApp(QMainWindow):
         # Hiển thị số người trong từng zone ngay dưới Shortest
         y_offset = 40 + 5 * line_spacing  # Đặt vị trí ngay sau "Shortest"
 
-        for zone_id, count in zone_counts.items():
+        for zone_id in valid_zone_ids:
             min_people = zone_min_people.get(zone_id, "N/A")
             max_people = zone_max_people.get(zone_id, 0)
 
@@ -394,26 +428,34 @@ class VideoApp(QMainWindow):
         self.last_frame = frame.copy()
         self.display_frame(frame)
 
-
     def export_statistics(self):
         """Ghi dữ liệu vào file CSV mỗi 30 giây."""
-        global people_count_log, longest_appearance, shortest_appearance # Tính số giây từ lúc bắt đầu
-        global max_longest_time_30s, min_shortest_time_30s  # Biến lưu giá trị theo 30 giây
+        global people_count_log, longest_appearance, shortest_appearance
+        global max_longest_time_30s, min_shortest_time_30s
 
         if not self.is_running:
             return  # Nếu video không chạy thì không ghi file
 
         # Lấy ngày & giờ hiện tại
         now = datetime.datetime.now()
-        date_str = now.strftime("%Y-%m-%d")  # Định dạng ngày: YYYY-MM-DD
-        time_str = now.strftime("%H:%M:%S")  # Định dạng giờ: HH:MM:SS
+        date_str = now.strftime("%Y-%m-%d")
+        time_str = now.strftime("%H:%M:%S")
 
-        file_exists = False
         try:
-            with open("people_statistics.csv", "r") as file:
-                file_exists = bool(file.readline())  # Kiểm tra xem file có dữ liệu chưa
-        except FileNotFoundError:
-            pass  # File chưa tồn tại, sẽ tạo mới
+            with open("people_statistics.csv", "r", newline="") as file:
+                csv_reader = csv.reader(file)
+                headers = next(csv_reader, [])  # Đọc dòng header đầu tiên
+                saved_zones = {int(col.split()[-1]) for col in headers if "Zone" in col}
+        except (FileNotFoundError, StopIteration):
+            saved_zones = set()
+            headers = []  # Nếu file chưa tồn tại, headers sẽ là danh sách rỗng
+
+        # Nếu file chưa tồn tại, tạo file mới với header mặc định
+        if not headers:
+            with open("people_statistics.csv", "w", newline="") as file:
+                writer = csv.writer(file)
+                writer.writerow(["Date", "Time", "People Count", "Person Out", 
+                                "Longest Camera", "Shortest Camera"])  # Header mặc định
 
         # Cập nhật Longest Camera (thời gian lớn nhất trong 30s)
         if longest_appearance['track_id'] is not None:
@@ -423,22 +465,81 @@ class VideoApp(QMainWindow):
         if shortest_appearance['track_id'] is not None:
             min_shortest_time_30s = min(min_shortest_time_30s, shortest_appearance['time'])
 
-        # Lấy ID của longest/shortest trong zone
-        longest_id = longest_appearance['track_id'] if longest_appearance['track_id'] is not None else "N/A"
-        shortest_id = shortest_appearance['track_id'] if shortest_appearance['track_id'] is not None else "N/A"
+        # Xác định các zone hiện có trên video
+        valid_zone_ids = sorted(set(zone_ids))  # Chỉ lấy zone đang xuất hiện trong video
 
-        # Ghi vào file CSV
+        # Dictionary lưu thời gian lâu nhất/ngắn nhất trong từng zone
+        zone_longest_time = {zone_id: 0 for zone_id in valid_zone_ids}
+        zone_shortest_time = {zone_id: float('inf') for zone_id in valid_zone_ids}
+        zone_longest_id = {zone_id: None for zone_id in valid_zone_ids}
+        zone_shortest_id = {zone_id: None for zone_id in valid_zone_ids}
+
+        # Tính thời gian trong từng zone dựa vào track_start_time
+        current_time = cv2.getTickCount() / cv2.getTickFrequency()
+        for track_id, data in track_start_time.items():
+            if track_id in track_to_fixed_id:
+                zone_id = track_to_fixed_id[track_id]
+                time_in_zone = current_time - data['start_time']
+
+                # Cập nhật longest time trong zone
+                if time_in_zone > zone_longest_time[zone_id]:
+                    zone_longest_time[zone_id] = time_in_zone
+                    zone_longest_id[zone_id] = track_id  # Ghi nhớ ID có thời gian lâu nhất  
+
+                # Cập nhật shortest time trong zone (chỉ tính nếu người đó đã ở ít nhất 2 giây)
+                if time_in_zone >= 2.0 and time_in_zone < zone_shortest_time[zone_id]:
+                    zone_shortest_time[zone_id] = time_in_zone 
+                    zone_shortest_id[zone_id] = track_id  # Ghi nhớ ID có thời gian lâu nhất 
+
+        # Ghi dữ liệu theo format ID (Time s)
+        longest_zone_values = [f"{zone_longest_id[zone_id]} ({round(zone_longest_time[zone_id], 1)}s)" if zone_longest_id[zone_id] is not None else "N/A"
+                               for zone_id in valid_zone_ids]
+
+        shortest_zone_values = [f"{zone_shortest_id[zone_id]} ({round(zone_shortest_time[zone_id], 1)}s)" if zone_shortest_id[zone_id] is not None else "N/A"
+                                for zone_id in valid_zone_ids]
+
+        # **Chỉ cập nhật saved_zones khi có zone mới xuất hiện**
+        if valid_zone_ids:
+            saved_zones.update(valid_zone_ids)  # Chỉ thêm các zone hiện có
+
+        # Nếu tất cả zone bị xóa, không cập nhật `saved_zones`
+        all_zones = sorted(saved_zones) if saved_zones else set()
+
+        # Nếu danh sách zone thay đổi, cập nhật lại header trong CSV
+        if all_zones != saved_zones:
+            with open("people_statistics.csv", "r") as file:
+                lines = file.readlines()  # Đọc toàn bộ nội dung CSV
+
+            # Mở file lần nữa để ghi dữ liệu mới
+            with open("people_statistics.csv", "w", newline="") as file:
+                writer = csv.writer(file)
+                zone_headers = []
+                for zone_id in all_zones:
+                    zone_headers.append(f"Longest Zone {zone_id}")
+                    zone_headers.append(f"Shortest Zone {zone_id}")
+
+                writer.writerow(["Date", "Time", "People Count", "Person Out", 
+                                "Longest Camera", "Shortest Camera"] + zone_headers)
+
+                if len(lines) > 1:  # Nếu có dữ liệu cũ, ghi lại
+                    file.writelines(lines[1:])  
+
+        # Mở lại file để thêm dữ liệu mới
         with open("people_statistics.csv", "a", newline="") as file:
             writer = csv.writer(file)
+            zone_values = []
+            for zone_id in all_zones:  # Duyệt theo danh sách zone đầy đủ
+                if zone_id in valid_zone_ids:  # Zone có dữ liệu mới
+                    longest_value = longest_zone_values[valid_zone_ids.index(zone_id)]
+                    shortest_value = shortest_zone_values[valid_zone_ids.index(zone_id)]
+                else:  # Zone đã bị xóa khỏi video nhưng vẫn có trong CSV
+                    longest_value = "N/A"
+                    shortest_value = "N/A"
+                zone_values.append(longest_value)
+                zone_values.append(shortest_value)
 
-            # Nếu file mới, ghi header
-            if not file_exists:
-                writer.writerow(["Date", "Time", "People Count", "Person Out",
-                                "Longest Camera", "Shortest Camera",
-                                "Longest Zone", "Shortest Zone"])
-                
             writer.writerow([date_str, time_str, self.total_people_count, self.person_out_last_30s, 
-                            round(max_longest_time_30s, 2), round(min_shortest_time_30s, 2), longest_id, shortest_id])
+                            round(max_longest_time_30s, 2), round(min_shortest_time_30s, 2)] + zone_values)
 
         # Reset lại giá trị sau khi ghi file để bắt đầu tính cho 30 giây tiếp theo
         max_longest_time_30s = 0
@@ -536,6 +637,11 @@ class VideoApp(QMainWindow):
                 person_appearance_times[track_id] = {'first_seen': current_time}
 
             time_in_camera = current_time - person_appearance_times[track_id]['first_seen']
+            
+            # **Tính thời gian trong zone, nhưng không tăng khi Pause**
+            elapsed_time = 0  # Thời gian trong zone
+            if track_id in track_start_time:
+                elapsed_time = current_time - track_start_time[track_id]['start_time']
 
             # Xác định longest/shortest
             bbox_color = (0, 255, 0)  # Mặc định màu xanh lá
@@ -554,12 +660,7 @@ class VideoApp(QMainWindow):
             fixed_id = self.get_fixed_id_for_track(track_id, (x1, y1, x2, y2))
             track_in_zone = fixed_id is not None  # Kiểm tra xem track có trong zone không
 
-            # # Nếu object đã có ID trước đó
-            # has_id = track_id in track_to_fixed_id
-
             if track_in_zone:
-                # Tính thời gian ở trong zone
-                elapsed_time = current_time - track_start_time.get(track_id, 0)
                 # Hiển thị ID và Time trong zone
                 display_text = f"ID: {fixed_id} Time: {elapsed_time:.1f}s"
 
@@ -571,7 +672,6 @@ class VideoApp(QMainWindow):
                 # Vẽ ID Time
                 cv2.putText(frame, display_text, (x1, y1 - 8), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-                
                 continue
             else:
                 # Nếu track rời khỏi zone, không hiển thị ID và Time
@@ -593,9 +693,6 @@ class VideoApp(QMainWindow):
     def get_fixed_id_for_track(self, track_id, track_bbox):
         """Xác định xem track_id có nằm trong vùng zone với ít nhất 80% diện tích không."""
         global track_to_fixed_id, track_start_time
-
-        # if track_id in track_to_fixed_id:
-        #     return track_to_fixed_id[track_id]
 
         x1, y1, x2, y2 = track_bbox
         bbox_area = (x2 - x1) * (y2 - y1)  # Diện tích bounding box
@@ -626,13 +723,8 @@ class VideoApp(QMainWindow):
         if max_overlap_ratio >= 0.8:
             track_to_fixed_id[track_id] = best_zone_id
             if track_id not in track_start_time:  # Chỉ gán thời gian lần đầu vào zone
-                track_start_time[track_id] = cv2.getTickCount() / cv2.getTickFrequency()
+                track_start_time[track_id] = {'start_time': cv2.getTickCount() / cv2.getTickFrequency()}
             return best_zone_id
-        
-        # if track_id in track_start_time:
-        #     # del track_to_fixed_id[track_id]
-        #     del track_start_time[track_id]
-
         return None
 
     def display_frame(self, frame):
@@ -646,7 +738,7 @@ class VideoApp(QMainWindow):
 
     def mousePressEvent(self, event):
         """Bắt sự kiện chuột để vẽ và xóa zone nhưng chỉ khi video đang Pause."""
-        global drawing, start_point
+        global drawing, start_point, temp_zones, fixed_zones, zone_ids, next_zone_id
 
         if self.is_running:  # Nếu video đang chạy, không cho phép vẽ hoặc xóa
             return
@@ -657,7 +749,7 @@ class VideoApp(QMainWindow):
 
             # Lấy kích thước thực tế của frame video
             if self.last_frame is not None:
-                frame_height, frame_width, _ = self.last_frame.shape  # Lấy kích thước frame thực sự
+                frame_height, frame_width, _ = self.last_frame.shape  
                 label_width = self.video_label.width()
                 label_height = self.video_label.height()
 
@@ -669,12 +761,18 @@ class VideoApp(QMainWindow):
 
         elif event.button() == Qt.MouseButton.RightButton:
             # Xóa zone khi bấm chuột phải
-            zone_deleted = False  # Đánh dấu nếu có zone nào bị xóa
-            for i in range(len(fixed_zones) - 1, -1, -1):  # Lặp ngược để xóa đúng vị trí
-                fx1, fy1 = fixed_zones[i][0]
-                fx2, fy2 = fixed_zones[i][1]
+            if not temp_zones and not fixed_zones:
+                return  # Không có zone nào để xóa
 
-                # Chuyển đổi tọa độ chuột hiện tại sang frame video trước khi so sánh
+            zone_deleted = False  
+            to_delete_temp = []  
+            to_delete_fixed = []  
+
+            # Kiểm tra zone tạm thời (`temp_zones`)
+            for i in range(len(temp_zones) - 1, -1, -1):  
+                fx1, fy1 = temp_zones[i][0]
+                fx2, fy2 = temp_zones[i][1]
+
                 if self.last_frame is not None:
                     frame_height, frame_width, _ = self.last_frame.shape
                     label_width = self.video_label.width()
@@ -687,31 +785,67 @@ class VideoApp(QMainWindow):
                     mouse_y = int(event.pos().y() * scale_y)
 
                     if fx1 <= mouse_x <= fx2 and fy1 <= mouse_y <= fy2:
-                        deleted_zone_id = zone_ids[i]  # Lấy ID của vùng bị xóa
-        
-                        # Xóa vùng khỏi danh sách
-                        del fixed_zones[i]
-                        del zone_ids[i]
+                        to_delete_temp.append(i)
+                        
+            # Kiểm tra zone đã lưu (`fixed_zones`)
+            for i in range(len(fixed_zones) - 1, -1, -1):
+                fx1, fy1 = fixed_zones[i][0]
+                fx2, fy2 = fixed_zones[i][1]
 
-                        # Xóa ID của những người thuộc vùng bị xóa để họ được tracking lại
-                        global track_to_fixed_id, track_start_time
-                        track_to_fixed_id = {tid: zid for tid, zid in track_to_fixed_id.items() if zid != deleted_zone_id}
-                        track_start_time = {tid: time for tid, time in track_start_time.items() if tid not in track_to_fixed_id}
+                if self.last_frame is not None:
+                    frame_height, frame_width, _ = self.last_frame.shape
+                    label_width = self.video_label.width()
+                    label_height = self.video_label.height()
 
-                        zone_deleted = True  # Đánh dấu rằng có zone bị xóa
-                        break  # Thoát vòng lặp sau khi xóa một vùng
+                    scale_x = frame_width / label_width
+                    scale_y = frame_height / label_height
 
-            # **Hiển thị ngay lập tức sau khi xóa**
+                    mouse_x = int(event.pos().x() * scale_x)
+                    mouse_y = int(event.pos().y() * scale_y)
+
+                    if fx1 <= mouse_x <= fx2 and fy1 <= mouse_y <= fy2:
+                        to_delete_fixed.append(i)
+                        
+            # Xóa tất cả các zone tìm thấy
+            for i in to_delete_temp:
+                temp_zones.pop(i)
+                zone_deleted = True
+                
+            max_deleted_zone_id = -1  # Lưu ID lớn nhất trong các zone bị xóa
+
+            for i in to_delete_fixed:
+                deleted_zone_id = zone_ids[i]  
+                del fixed_zones[i]
+                del zone_ids[i]
+
+                # **Cập nhật ID lớn nhất bị xóa**
+                max_deleted_zone_id = max(max_deleted_zone_id, deleted_zone_id)
+
+                # Xóa ID của những người thuộc vùng bị xóa để họ được tracking lại
+                global track_to_fixed_id, track_start_time
+                track_to_fixed_id = {tid: zid for tid, zid in track_to_fixed_id.items() if zid != deleted_zone_id}
+                track_start_time = {tid: time for tid, time in track_start_time.items() if tid not in track_to_fixed_id}
+
+                zone_deleted = True
+                
+            # Cập nhật `next_zone_id` để đảm bảo ID luôn tăng
+            if max_deleted_zone_id != -1:  
+                next_zone_id = max(next_zone_id, max_deleted_zone_id + 1)
+
+            # Cập nhật lại frame ngay lập tức
             if zone_deleted and self.last_frame is not None:
                 updated_frame = self.last_frame.copy()
-                updated_frame = self.draw_fixed_zones(updated_frame)  # Vẽ lại frame không có zone bị xóa
-                self.last_frame = updated_frame.copy()  # Lưu lại frame mới nhất
-                self.display_frame(updated_frame)  # Hiển thị ngay lập tức  
-              
 
+                # Vẽ lại tất cả zone còn lại
+                for zone in temp_zones:
+                    cv2.rectangle(updated_frame, zone[0], zone[1], (255, 0, 0), 2)  
+
+                updated_frame = self.draw_fixed_zones(updated_frame)  
+                self.display_frame(updated_frame)  
+   
     def mouseReleaseEvent(self, event):
         """Kết thúc vẽ zone nhưng chỉ khi video đang Pause."""
-        global drawing, end_point, fixed_zones, zone_ids
+        global drawing, end_point, temp_zones, zone_ids, next_zone_id
 
         if self.is_running:  # Nếu video đang chạy, không cho phép vẽ
             return
@@ -739,15 +873,12 @@ class VideoApp(QMainWindow):
                 x2, y2 = end_point
 
                 # Đảm bảo luôn lưu theo thứ tự (trái, trên) -> (phải, dưới)
-                fixed_zones.append(((min(x1, x2), min(y1, y2)), (max(x1, x2), max(y1, y2))))
-                zone_ids.append(self.zone_counter)  
-                self.zone_counter += 1  # Tăng số thứ tự cho zone tiếp theo
-
+                temp_zones.append(((min(x1, x2), min(y1, y2)), (max(x1, x2), max(y1, y2))))
                 # Cập nhật frame ngay sau khi vẽ zone
                 updated_frame = self.last_frame.copy()
-                updated_frame = self.draw_fixed_zones(updated_frame)  # Vẽ lại với zone mới
 
-                self.last_frame = updated_frame.copy()  # Cập nhật frame mới nhất
+                for zone in temp_zones:
+                    cv2.rectangle(updated_frame, zone[0], zone[1], (255, 225, 225), 2)  # Màu xanh dương cho zone tạm thời
                 self.display_frame(updated_frame)  # Hiển thị ngay lập tức
 
     def mouseMoveEvent(self, event):
@@ -756,8 +887,6 @@ class VideoApp(QMainWindow):
 
         if self.is_running:  # Nếu video đang chạy, không cho phép vẽ
             return
-
-        # self.video_label.setCursor(Qt.CursorShape.CrossCursor)
 
         if drawing:
             # Lấy kích thước gốc của frame video
