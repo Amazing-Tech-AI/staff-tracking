@@ -102,7 +102,7 @@ class VideoApp(QMainWindow):
         self.setCentralWidget(container)
 
         # Khởi tạo video và YOLO
-        self.model = YOLOv10("./weights/yolov10x.pt").to("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = YOLOv10("./weights/yolov10n.pt").to("cuda" if torch.cuda.is_available() else "cpu")
         self.tracker = DeepSort(max_age=20, n_init=3)
 
         # Timer để cập nhật frame
